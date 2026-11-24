@@ -7,4 +7,5 @@ installation
 cli
 presto/hello-world
 flex/hello-world
+flex/events
 ```

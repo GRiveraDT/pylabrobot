@@ -533,3 +533,69 @@ Treat operation names and documented field meanings as public integration contra
 
 When implementation and this registry diverge, update them together and add tests that assert the
 canonical operation name, lifecycle, and payload fields.
+
+### KingFisher Flex
+
+Flex uses the `kingfisher` family for local BDZ execution. All semantic operations
+include `device`, `resources`, `serial_number`, and `firmware`. Identity fields may be
+`None` before identification; `setup.completed` contains the discovered identity.
+Run and resource data are compact references, not live objects or complete BDZ files.
+
+| Operation | Additional fields | Completion boundary |
+| --- | --- | --- |
+| `kingfisher.setup` | Discovered identity on completion | Identification exchange completed; cached setup does not repeat I/O. |
+| `kingfisher.initialize` | None | Axis initialization completed, or already initialized. |
+| `kingfisher.stop` | None | Transport disconnected; not a motion-stop guarantee. |
+| `kingfisher.abort` | None | Abort terminal response received. |
+| `kingfisher.run_protocol` | `protocol_name`, `source_sha256` when the argument is bound; all bound plates in `resources` | All script actions and finalization commands completed. Includes validation failures before I/O. |
+| `kingfisher.load`, `kingfisher.unload`, `kingfisher.pause` | `bdz_plate_id`, `bdz_plate_name`, `source_sha256`, `line_number`, `label`, `acknowledgement`, `processing_slot`, `loading_slot`, `presented_holder`, `plate_location`, `additions` | Fulfillment returned and expected occupancy was verified. `plate_location` is refreshed on completion, which also includes `inventory_verified`. |
+| `kingfisher.rotate` | `line_number`, `target_processing_slot`, `target_loading_slot`, `processing`, `loading`, `inventory_verified`, `requested_plate` | MOR terminal response received and orientation published. |
+| `kingfisher.step` | Common span fields below; `unmapped_features` | Last command associated with the named exported step completed. |
+| `kingfisher.mix` | Common span fields; `phase`, `iteration`, `segment_index`, `duration` | One timed mixing command completed. |
+| `kingfisher.collect_beads` | Common span fields; `phase`, `cycle_index`, `cycle_count`; `duration` for timed collection | Recognized collection cycle completed. |
+| `kingfisher.pick_up_tip_comb`, `kingfisher.return_tip_comb` | Common span fields excluding step fields; `tip_name`, `tip_index` | Recognized 96DW pickup/return command sequence completed. |
+
+Common span fields: `protocol_name`, `source_sha256`, `first_line`, `last_line`,
+`bdz_plate_id`, `bdz_plate_name`, and the directly involved plate in `resources`.
+Named step and substep spans also include `step_name`, `step_type`, `step_index`,
+and `script_label`. Source lines and all indices are one-based. Mixing phases are
+`release`, `mixing`, `postmix`, or `unspecified`; `iteration` is `None` outside
+identified main-mixing loops. Collection phases are `collection` or `precollection`.
+Durations are seconds: mixing duration is the motion command's timed duration;
+collection duration is its collection hold, excluding positioning and settling.
+
+Rotation station objects `processing` and `loading` contain `tray`, `holder`,
+`expected_plate`, and `actual_plate`. These are dispatch-time snapshots. Actual means
+resource-model occupancy, not measured physical occupancy. Expected means planned
+occupancy at that point in execution; initialization uses the current model.
+`requested_plate` is separate from expected occupancy and identifies an immediately
+following loading/unloading/intervention request, if any. The carousel itself is the
+direct resource of rotation. Initialization's internal rotation has `line_number=0`.
+
+Action `additions` contains `plate_id`, `reagent_name`, and per-well `volume` in PLR's
+default units. `plate_location` is the bound plate's current parent, or `None`.
+A Flex action is fulfillment and verification, not a second physical transfer event;
+source/destination movement events belong to the handler's executor. A preloaded
+plate still requires fulfillment and verification.
+
+Observations (no lifecycle suffix):
+
+| Name | Additional fields | Meaning |
+| --- | --- | --- |
+| `kingfisher.script_label` | `label`, `line_number` | TXT was acknowledged, not completed physical work. |
+| `kingfisher.temperature_report` | `report` | Raw unsolicited TEM report; no assertion that a target was reached. |
+| `kingfisher.session_invalidated` | `error_message` | Session certainty was lost; not an additional operation terminal event. |
+
+Reader callbacks preserve the originating command's execution context. Observations
+outside a run use the connection's application context. No automatic run ID is
+invented; callers can supply one through `event_context`. Each lifecycle has its own
+operation ID. Events do not acknowledge actions or alter firmware commands. Comb
+completion cannot verify attachment; collection completion cannot verify bead capture.
+Unknown labels retain raw observations. Unmatched substeps are not guessed:
+`step.unmapped_features` (in the step event's data) identifies `mix_phases`,
+`collection_cycles`, or `precollection` that could not be mapped. Mixing segments
+with uncertain metadata association use `phase="unspecified"`. Tip events require
+matching complete command sequences and the declared pickup/return tray.
+
+See the [Flex event guide](../user_guide/thermo_fisher/kingfisher/flex/events.md)
+for subscription and execution examples.

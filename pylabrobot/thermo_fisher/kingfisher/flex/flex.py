@@ -3,11 +3,21 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import ExitStack
+from contextvars import Context, copy_context
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
+from pylabrobot.events import (
+  device_reference,
+  emit_event,
+  event_operation,
+  evented_operation,
+  is_event_bus_active,
+  resource_reference,
+)
 from pylabrobot.io.hid import HID
-from pylabrobot.resources import PlateHolder, Resource
+from pylabrobot.resources import PlateCarrier, PlateHolder, Resource
 from pylabrobot.thermo_fisher.kingfisher.flex.actions import (
   FlexAction,
   create_actions,
@@ -27,6 +37,7 @@ from pylabrobot.thermo_fisher.kingfisher.flex.protocol import (
   FlexProtocolError,
   loading_slot,
 )
+from pylabrobot.thermo_fisher.kingfisher.flex.progress import ProgressSpan, progress_spans
 from pylabrobot.thermo_fisher.kingfisher.flex.resource_model import create_carousel
 
 logger = logging.getLogger(__name__)
@@ -66,6 +77,16 @@ class FlexRunResult:
   source_kind: Literal["bdz"] = "bdz"
 
 
+def _device_event_data(flex: "KingFisherFlex") -> dict[str, Any]:
+  """Snapshot frontend identity without accessing hardware."""
+  return {
+    "device": device_reference(flex, name=flex.name),
+    "resources": [],
+    "serial_number": flex.serial,
+    "firmware": flex.version,
+  }
+
+
 class KingFisherFlex:
   """Run supported 96DW BindIt exports over USB HID.
 
@@ -83,6 +104,14 @@ class KingFisherFlex:
     name: Resource-name prefix. Use distinct names for instruments in the same resource tree.
   """
 
+  name: str
+  carousel: PlateCarrier
+  operation_timeout: float
+  _connection: FlexConnection
+  _session_context: Context
+  _telemetry_context: Optional[Context]
+  _session_failed: asyncio.Event
+  _operations: asyncio.Lock
   _events_closed: bool
   _events: asyncio.Queue[Optional[FlexEvent]]
   _processing_slot: Optional[int]
@@ -91,6 +120,92 @@ class KingFisherFlex:
   _run_actions: dict[int, FlexAction]
   _action_acknowledgement: Optional[Literal["host", "instrument"]]
   state: Literal["disconnected", "idle", "initializing", "ready", "running", "waiting", "uncertain"]
+
+  def _observe(self, name: str, **data: Any) -> None:
+    """Publish reader observations in the originating command's execution context."""
+    payload = {**_device_event_data(self), **data}
+    if self._telemetry_context is not None:
+      self._telemetry_context.copy().run(emit_event, name, **payload)
+    else:
+      self._session_context.copy().run(emit_event, name, **payload)
+
+  def _span_data(self, span: ProgressSpan, protocol: FlexBoundProtocol) -> dict[str, Any]:
+    """Serialize metadata references at operation entry, without retaining live resources."""
+    plate = protocol.plates_by_id.get(span.plate_id) if span.plate_id is not None else None
+    names = {p.id: p.name for p in protocol.protocol.plates}
+    return {
+      **_device_event_data(self),
+      **span.details,
+      "resources": [resource_reference(plate)] if plate is not None else [],
+      "bdz_plate_id": span.plate_id,
+      "bdz_plate_name": names.get(span.plate_id or ""),
+      "protocol_name": protocol.protocol.name,
+      "source_sha256": protocol.protocol.sha256,
+      "first_line": span.first_line,
+      "last_line": span.last_line,
+    }
+
+  def _action_data(self, action: FlexAction, mode: str) -> dict[str, Any]:
+    """Capture the requested action and current modeled transfer endpoints."""
+    data = {
+      **_device_event_data(self),
+      "resources": [resource_reference(action.plate)] if action.plate is not None else [],
+      "bdz_plate_id": action.plate_id,
+      "bdz_plate_name": action.plate_name,
+      "source_sha256": action.source_sha256,
+      "line_number": action.line_number,
+      "label": action.label,
+      "acknowledgement": mode,
+      "processing_slot": action.processing_slot,
+      "loading_slot": action.loading_slot,
+      "presented_holder": resource_reference(action.holder),
+      "plate_location": resource_reference(action.plate.parent)
+      if action.plate is not None
+      else None,
+      "additions": [
+        {"plate_id": a.plate_id, "reagent_name": a.reagent_name, "volume": a.volume}
+        for a in action.additions
+      ],
+    }
+    return data
+
+  async def _rotate(
+    self,
+    command: FlexCommand,
+    expected: tuple[Optional[Resource], ...],
+    requested_action: Optional[FlexAction] = None,
+  ) -> None:
+    """Report rotation targets and publish orientation only after terminal completion."""
+    processing = int(command.text.split()[1])
+    loading = loading_slot(processing)
+
+    def station(slot: int) -> dict[str, Any]:
+      """Compare an execution expectation with the current resource tree, not sensors."""
+      return {
+        "tray": slot,
+        "holder": resource_reference(self.carousel[slot]),
+        "expected_plate": resource_reference(expected[slot - 1]),
+        "actual_plate": resource_reference(self.carousel[slot].resource),
+      }
+
+    data = {
+      **_device_event_data(self),
+      "resources": [resource_reference(self.carousel)],
+      "line_number": command.line_number,
+      "target_processing_slot": processing,
+      "target_loading_slot": loading,
+      "processing": station(processing),
+      "loading": station(loading),
+      "inventory_verified": self.inventory_verified,
+      "requested_plate": resource_reference(requested_action.plate)
+      if requested_action is not None
+      else None,
+    }
+    self._processing_slot = None
+    with event_operation("kingfisher.rotate", **data):
+      self._telemetry_context = copy_context()
+      await self._connection.command(command.text, self.operation_timeout)
+      self._processing_slot = processing
 
   def _publish(self, event: FlexEvent) -> None:
     """Publish workflow events to one consumer and the module logger."""
@@ -111,6 +226,7 @@ class KingFisherFlex:
     self._processing_slot = None
     self.state = "uncertain"
     self._session_failed.set()
+    self._observe("kingfisher.session_invalidated", error_message=str(error))
     self._publish(FlexEvent("failure", str(error)))
     self._close_events()
 
@@ -157,6 +273,7 @@ class KingFisherFlex:
     if self._events_closed:
       return
     if message.opcode == "TEM" and message.kind == "report":
+      self._observe("kingfisher.temperature_report", report=message.text)
       self._publish(FlexEvent("temperature", message.text))
     command = self._current_command
     if message.kind != "ack" or command is None or message.opcode != command.opcode:
@@ -167,6 +284,9 @@ class KingFisherFlex:
       self.state = "waiting"
       self._publish(FlexEvent(prompt.action, prompt.label, prompt))
     elif command.opcode == "TXT":
+      self._observe(
+        "kingfisher.script_label", label=command.text.split('"')[1], line_number=command.line_number
+      )
       self._publish(FlexEvent("step", command.text.split('"')[1]))
 
   def __init__(
@@ -182,6 +302,8 @@ class KingFisherFlex:
     validate_timeout(operation_timeout, "operation_timeout")
     if not name.strip():
       raise ValueError("name must not be empty")
+    self._session_context = copy_context()
+    self._telemetry_context = None
     self.name = name
     self.carousel = create_carousel(name)
     self._inventory_verified = False
@@ -273,38 +395,44 @@ class KingFisherFlex:
 
   async def setup(self) -> None:
     """Identify the instrument without EAK, fault acknowledgment or motion commands."""
-    async with self._lifecycle:
-      if self._connected:
-        self._connection.check_open()
-        return
-      self._inventory_verified = False
-      self._processing_slot = None
-      logger.warning(
-        "KingFisher Flex is experimental. Hardware checks cover firmware 1.01.0 on macOS "
-        "with 96DW mixing/bead methods, 37 C heating and host confirmations. "
-        "Partial tip pickup remains unresolved. "
-        "Resource-aware host and physical-Start transfers and a host reagent-addition "
-        "intervention are tested. See the Flex guide for tested scope."
-      )
-      self._events = asyncio.Queue()
-      self._session_failed = asyncio.Event()
-      self._events_closed = False
-      self._connection.io = self.io
-      try:
-        await self._connection.setup()
-        response = await self._connection.command("VER", self.timeout)
-        identity = [line.split() for line in response if line.startswith("VER KingFisherFlex ")]
-        if len(identity) != 1 or len(identity[0]) != 4:
-          raise FlexError(f"Expected one KingFisherFlex identification, received {response!r}")
-        self.version, self.serial = identity[0][2:]
-        self._connected = True
-        self.state = "idle"
-        logger.info("Connected to Flex firmware %s, serial %s", self.version, self.serial)
-      except BaseException:
-        await self._connection.stop()
-        self.state = "disconnected"
-        self.version = self.serial = None
-        raise
+    self._session_context = copy_context()
+    with event_operation(
+      "kingfisher.setup",
+      **_device_event_data(self),
+      completed_data_factory=lambda: _device_event_data(self),
+    ):
+      async with self._lifecycle:
+        if self._connected:
+          self._connection.check_open()
+          return
+        self._inventory_verified = False
+        self._processing_slot = None
+        logger.warning(
+          "KingFisher Flex is experimental. Hardware checks cover firmware 1.01.0 on macOS "
+          "with 96DW mixing/bead methods, 37 C heating and host confirmations. "
+          "Partial tip pickup remains unresolved. "
+          "Resource-aware host and physical-Start transfers and a host reagent-addition "
+          "intervention are tested. See the Flex guide for tested scope."
+        )
+        self._events = asyncio.Queue()
+        self._session_failed = asyncio.Event()
+        self._events_closed = False
+        self._connection.io = self.io
+        try:
+          await self._connection.setup()
+          response = await self._connection.command("VER", self.timeout)
+          identity = [line.split() for line in response if line.startswith("VER KingFisherFlex ")]
+          if len(identity) != 1 or len(identity[0]) != 4:
+            raise FlexError(f"Expected one KingFisherFlex identification, received {response!r}")
+          self.version, self.serial = identity[0][2:]
+          self._connected = True
+          self.state = "idle"
+          logger.info("Connected to Flex firmware %s, serial %s", self.version, self.serial)
+        except BaseException:
+          await self._connection.stop()
+          self.state = "disconnected"
+          self.version = self.serial = None
+          raise
 
   def _check_operation(self) -> None:
     """Reject concurrent operations rather than queuing an unintended second run."""
@@ -312,6 +440,7 @@ class KingFisherFlex:
     if self._operations.locked():
       raise FlexError("Another Flex operation is active")
 
+  @evented_operation("kingfisher.initialize", _device_event_data)
   async def initialize(self) -> None:
     """Initialize axes and disable heating; this can move axes and present tray 4 for loading.
 
@@ -327,7 +456,11 @@ class KingFisherFlex:
       self._processing_slot = None
       try:
         for command in ("EAK", "TEM 0 300", "MOI 0", "MOS 0", "MOM 0", "MOH 0 100", "MOR 1"):
-          await self._connection.command(command, self.operation_timeout)
+          if command == "MOR 1":
+            await self._rotate(FlexCommand(0, command), self._inventory_snapshot())
+          else:
+            await self._connection.command(command, self.operation_timeout)
+        self._telemetry_context = None
         self._processing_slot = 1
         self._initialized = True
         self.state = "ready"
@@ -336,6 +469,8 @@ class KingFisherFlex:
         self._processing_slot = None
         self.state = "uncertain"
         raise
+      finally:
+        self._telemetry_context = None
 
   async def wait_for_physical_start(self, action: FlexAction) -> None:
     """Send the selected action's original PAU and await its firmware completion once.
@@ -449,129 +584,179 @@ class KingFisherFlex:
     reader continues to detect disconnects and errors. Cancellation does not
     abort hardware: it invalidates the session and requires explicit recovery.
     """
-    validate_timeout(operator_timeout, "operator_timeout", allow_none=True)
-    if acknowledgement is not None and not callable(acknowledgement):
-      if acknowledgement not in ("host", "instrument"):
-        raise ValueError("acknowledgement must be 'host', 'instrument', or a selector")
-    if handle_action is not None and not callable(handle_action):
-      raise TypeError("handle_action must be an async callable")
-    if acknowledgement == "host" and handle_action is None:
-      raise ValueError("Host acknowledgment requires an action handler")
-    if not isinstance(protocol, FlexBoundProtocol):
-      raise FlexProtocolError(
-        "Plate bindings are required before execution; use "
-        "read_flex_bdz(source).bind_plates({bdz_plate_name: plr_plate, ...})"
+    data = _device_event_data(self)
+    if isinstance(protocol, FlexBoundProtocol):
+      data.update(
+        protocol_name=protocol.protocol.name,
+        source_sha256=protocol.protocol.sha256,
+        resources=[resource_reference(p) for p in protocol.plates_by_id.values()],
       )
-    parsed = protocol.protocol
-    commands = parsed.preflight()
-    actions = create_actions(protocol, self.carousel, commands)
-    self._check_operation()
-    if not self._initialized:
-      raise FlexError("Call initialize() explicitly before running a protocol")
-    self._require_inventory()
-    planned = self._inventory_snapshot()
-    for action in actions.values():
-      planned = expected_inventory(action, planned)
-    async with self._operations:
-      self._run_actions = actions
-      self.state = "running"
-      self._publish(FlexEvent("run_started", parsed.name))
-      timer_duration = 0.0
-      completed = 0
-      host_confirmations = 0
-      try:
-        # BindIt repeats this preamble at run start, separately from connection startup.
-        for line in ("EAK", "MOI 0", "MOS 0", "MOM 0", "MOH 0 100", "TEM 0 300"):
-          self._require_inventory()
-          await self._connection.command(line, self.operation_timeout)
-          self._require_inventory()
-        for command in commands:
-          self._require_inventory()
-          self._current_command = command
-          if command.opcode == "PAU":
-            if self._processing_slot is None:
-              raise FlexError("Action requires a completed carousel orientation")
-            action = self._prompt_for_command(command, self._processing_slot)
-            expected = expected_inventory(action, self._inventory_snapshot())
-            self._current_prompt = action
-            self._inventory_verified = False
-            handler = handle_action
-            if callable(acknowledgement):
-              mode = acknowledgement(action)
-            elif acknowledgement is None:
-              mode = "host" if handler is not None else "instrument"
-            else:
-              mode = acknowledgement
-            if mode not in ("host", "instrument"):
-              raise ValueError("Acknowledgment selector must return 'host' or 'instrument'")
-            if mode == "host" and handler is None:
-              raise FlexError("Host acknowledgment requires an action handler")
-            self._action_acknowledgement = mode
-            self._physical_pause_started = False
-            self._physical_pause_completed = False
-            if handler is not None:
-              await self._await_action_handler(action, handler, operator_timeout)
-            else:
-              await wait_for_completion(self.wait_for_physical_start(action), operator_timeout)
-            if mode == "instrument":
+    with event_operation("kingfisher.run_protocol", **data):
+      validate_timeout(operator_timeout, "operator_timeout", allow_none=True)
+      if acknowledgement is not None and not callable(acknowledgement):
+        if acknowledgement not in ("host", "instrument"):
+          raise ValueError("acknowledgement must be 'host', 'instrument', or a selector")
+      if handle_action is not None and not callable(handle_action):
+        raise TypeError("handle_action must be an async callable")
+      if acknowledgement == "host" and handle_action is None:
+        raise ValueError("Host acknowledgment requires an action handler")
+      if not isinstance(protocol, FlexBoundProtocol):
+        raise FlexProtocolError(
+          "Plate bindings are required before execution; use "
+          "read_flex_bdz(source).bind_plates({bdz_plate_name: plr_plate, ...})"
+        )
+      parsed = protocol.protocol
+      commands = parsed.preflight()
+      actions = create_actions(protocol, self.carousel, commands)
+      spans = progress_spans(parsed, commands) if is_event_bus_active() else []
+      starts: dict[int, list[ProgressSpan]] = {}
+      for span in spans:
+        starts.setdefault(span.first_line, []).append(span)
+      self._check_operation()
+      if not self._initialized:
+        raise FlexError("Call initialize() explicitly before running a protocol")
+      self._require_inventory()
+      planned = self._inventory_snapshot()
+      for action in actions.values():
+        planned = expected_inventory(action, planned)
+      async with self._operations:
+        self._run_actions = actions
+        self.state = "running"
+        self._publish(FlexEvent("run_started", parsed.name))
+        timer_duration = 0.0
+        completed = 0
+        host_confirmations = 0
+        try:
+          self._telemetry_context = copy_context()
+          # BindIt repeats this preamble at run start, separately from connection startup.
+          for line in ("EAK", "MOI 0", "MOS 0", "MOM 0", "MOH 0 100", "TEM 0 300"):
+            self._require_inventory()
+            await self._connection.command(line, self.operation_timeout)
+            self._require_inventory()
+          expected = self._inventory_snapshot()
+          active: list[tuple[ProgressSpan, ExitStack]] = []
+          with ExitStack() as progress:
+            for command_index, command in enumerate(commands):
+              for span in starts.get(command.line_number, []):
+                scope = progress.enter_context(ExitStack())
+                scope.enter_context(
+                  event_operation(f"kingfisher.{span.operation}", **self._span_data(span, protocol))
+                )
+                active.append((span, scope))
+              self._telemetry_context = copy_context()
+              self._require_inventory()
+              self._current_command = command
+              if command.opcode == "PAU":
+                if self._processing_slot is None:
+                  raise FlexError("Action requires a completed carousel orientation")
+                action = self._prompt_for_command(command, self._processing_slot)
+                expected = expected_inventory(action, self._inventory_snapshot())
+                self._current_prompt = action
+                self._inventory_verified = False
+                handler = handle_action
+                if callable(acknowledgement):
+                  mode = acknowledgement(action)
+                elif acknowledgement is None:
+                  mode = "host" if handler is not None else "instrument"
+                else:
+                  mode = acknowledgement
+                if mode not in ("host", "instrument"):
+                  raise ValueError("Acknowledgment selector must return 'host' or 'instrument'")
+                if mode == "host" and handler is None:
+                  raise FlexError("Host acknowledgment requires an action handler")
+                self._action_acknowledgement = mode
+                self._physical_pause_started = False
+                self._physical_pause_completed = False
+                action_data = self._action_data(action, mode)
+                with event_operation(
+                  f"kingfisher.{action.action}",
+                  **action_data,
+                  completed_data_factory=lambda: {
+                    **action_data,
+                    "plate_location": resource_reference(action.plate.parent)
+                    if action.plate is not None
+                    else None,
+                    "inventory_verified": self.inventory_verified,
+                  },
+                ):
+                  self._telemetry_context = copy_context()
+                  if handler is not None:
+                    await self._await_action_handler(action, handler, operator_timeout)
+                  else:
+                    await wait_for_completion(
+                      self.wait_for_physical_start(action), operator_timeout
+                    )
+                  if mode == "instrument":
+                    completed += 1
+                  else:
+                    host_confirmations += 1
+                  self._complete_action(action, expected)
+                  self._publish(
+                    FlexEvent(
+                      "host_prompt_completed" if mode == "host" else "prompt_completed",
+                      action.label,
+                      action,
+                    )
+                  )
+                self._current_prompt = None
+                self._action_acknowledgement = None
+                self.state = "running"
+                while active and active[-1][0].last_line == command.line_number:
+                  active.pop()[1].close()
+                self._telemetry_context = copy_context()
+                continue
+              fields = command.text.split()
+              deadline: Optional[float] = self.operation_timeout
+              if command.opcode == "MOH" and len(fields) == 6:
+                deadline = int(fields[4]) / 100 + self.operation_timeout
+              elif command.opcode == "WAI":
+                if len(fields) == 3:
+                  timer_duration = int(fields[2]) / 100
+                else:
+                  deadline = timer_duration + self.operation_timeout
+              if command.opcode == "MOR":
+                following = (
+                  commands[command_index + 1] if command_index + 1 < len(commands) else None
+                )
+                requested = actions.get(following.line_number) if following is not None else None
+                await self._rotate(command, expected, requested)
+              else:
+                await self._connection.command(command.text, deadline)
+              self._require_inventory()
               completed += 1
-            else:
-              host_confirmations += 1
-            self._complete_action(action, expected)
-            self._publish(
-              FlexEvent(
-                "host_prompt_completed" if mode == "host" else "prompt_completed",
-                action.label,
-                action,
-              )
-            )
-            self._current_prompt = None
-            self._action_acknowledgement = None
-            self.state = "running"
-            continue
-          fields = command.text.split()
-          deadline: Optional[float] = self.operation_timeout
-          if command.opcode == "MOH" and len(fields) == 6:
-            deadline = int(fields[4]) / 100 + self.operation_timeout
-          elif command.opcode == "WAI":
-            if len(fields) == 3:
-              timer_duration = int(fields[2]) / 100
-            else:
-              deadline = timer_duration + self.operation_timeout
-          if command.opcode == "MOR":
-            self._processing_slot = None
-          await self._connection.command(command.text, deadline)
-          self._require_inventory()
-          completed += 1
-          if command.opcode == "MOR":
-            self._processing_slot = int(fields[1])
-        self._current_command = None
-        for line in ('TXT "END_OF_RUN"', "TEM 0 300", "TEM 0 300"):
-          self._require_inventory()
-          await self._connection.command(line, self.operation_timeout)
-          self._require_inventory()
-        self._connection.check_open()
-        self.state = "ready"
-        self._publish(FlexEvent("run_completed", parsed.name))
-        return FlexRunResult(parsed.name, parsed.sha256, completed, host_confirmations)
-      except BaseException as error:
-        self._connection.invalidate(FlexError(f"Protocol interrupted or failed: {error}"))
-        self._initialized = False
-        self._processing_slot = None
-        self.state = "uncertain"
-        raise
-      finally:
-        self._current_command = None
-        self._current_prompt = None
-        self._run_actions = {}
-        self._action_acknowledgement = None
-        self._physical_pause_started = False
-        self._physical_pause_completed = False
+              while active and active[-1][0].last_line == command.line_number:
+                active.pop()[1].close()
+              self._telemetry_context = copy_context()
+          self._current_command = None
+          for line in ('TXT "END_OF_RUN"', "TEM 0 300", "TEM 0 300"):
+            self._require_inventory()
+            await self._connection.command(line, self.operation_timeout)
+            self._require_inventory()
+          self._connection.check_open()
+          self.state = "ready"
+          self._publish(FlexEvent("run_completed", parsed.name))
+          return FlexRunResult(parsed.name, parsed.sha256, completed, host_confirmations)
+        except BaseException as error:
+          self._connection.invalidate(FlexError(f"Protocol interrupted or failed: {error}"))
+          self._initialized = False
+          self._processing_slot = None
+          self.state = "uncertain"
+          raise
+        finally:
+          self._telemetry_context = None
+          self._current_command = None
+          self._current_prompt = None
+          self._run_actions = {}
+          self._action_acknowledgement = None
+          self._physical_pause_started = False
+          self._physical_pause_completed = False
 
+  @evented_operation("kingfisher.abort", _device_event_data)
   async def abort(self) -> None:
     """Request PC abort without waiting for the active command or operator pause."""
     await self._connection.abort()
 
+  @evented_operation("kingfisher.stop", _device_event_data)
   async def stop(self) -> None:
     """Disconnect and invalidate position; never claim that disconnect stops motion."""
     async with self._lifecycle:
@@ -585,6 +770,7 @@ class KingFisherFlex:
         async with self._operations:
           pass
       finally:
+        self._telemetry_context = None
         self._connected = False
         self._initialized = False
         self._processing_slot = None

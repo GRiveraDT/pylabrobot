@@ -133,6 +133,7 @@ events; separately listed observations have no lifecycle suffix.
 | `agilent.vspin.Access2` | `centrifuge_loader.setup`, `centrifuge_loader.stop`, `centrifuge_loader.load`, `centrifuge_loader.unload` |
 | `brooks.precise_flex.PreciseFlexDriver` | lifecycle, fault/home/freedrive, joint/cartesian/rail/gripper motion, pick/drop, park |
 | `manual_operator.ManualOperator` | arbitrary acknowledged manual actions; resource moves |
+| `thermo_fisher.kingfisher.flex.KingFisherFlex` | lifecycle, bound BDZ execution, action fulfillment, carousel rotation, named steps, mixing, collection and tip-comb handling |
 
 Detailed operation references:
 
@@ -145,6 +146,7 @@ Detailed operation references:
 - [Diagnostic transports](event-bus/diagnostic-transports.md)
 - [Canonical schema for every operation above](../../contributor_guide/event-schemas.md)
 - [Manual operator actions](manual-operator.md#eventbus-integration)
+- [KingFisher Flex execution](../thermo_fisher/kingfisher/flex/events.md)
 
 ```{toctree}
 :hidden:
